@@ -1,0 +1,6 @@
+crewai
+crewai-tools
+python-dotenv
+langchain-groq  # free & fast (or langchain-openai if you prefer)
+pydantic
+pandas
