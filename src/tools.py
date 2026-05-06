@@ -5,6 +5,9 @@ from datetime import datetime, timedelta
 import hashlib
 import json
 
+from src import state
+from src.state import SERVICE_CATALOG  # re-exported so existing call sites keep working
+
 # ============================================================================
 # DATA MODELS FOR STRUCTURED OUTPUTS
 # ============================================================================
@@ -122,135 +125,8 @@ THREAT_INTELLIGENCE = {
     }
 }
 
-# SERVICE CATALOG WITH DEPENDENCIES
-SERVICE_CATALOG = {
-    "Mobile Banking": {
-        "tier": 1,
-        "rto_hours": 4,
-        "rpo_minutes": 15,
-        "mtpd_hours": 6,
-        "owner": "Banking Services Team",
-        "dr_strategy": "Hot Standby",
-        "last_dr_test": "2026-03-15",
-        "dr_test_result": "PASSED",
-        "customers": 1_200_000,
-        "hourly_revenue": 2_400_000,
-        "dependencies": [],
-        "compliance": ["PCI-DSS 3.4", "SOX 302", "GDPR 5.1"]
-    },
-    "Fraud Detection": {
-        "tier": 1,
-        "rto_hours": 2,
-        "rpo_minutes": 5,
-        "mtpd_hours": 3,
-        "owner": "Risk Management Team",
-        "dr_strategy": "Hot Standby",
-        "last_dr_test": "2026-03-10",
-        "dr_test_result": "PASSED",
-        "customers": 800_000,
-        "hourly_revenue": 1_800_000,
-        "dependencies": ["Payment Processing"],
-        "compliance": ["PCI-DSS 6.5.10", "FFIEC BCM"]
-    },
-    "Online Transfers": {
-        "tier": 1,
-        "rto_hours": 4,
-        "rpo_minutes": 15,
-        "mtpd_hours": 6,
-        "owner": "Core Banking Team",
-        "dr_strategy": "Hot Standby",
-        "last_dr_test": "2026-03-12",
-        "dr_test_result": "PASSED",
-        "customers": 500_000,
-        "hourly_revenue": 1_100_000,
-        "dependencies": ["Mobile Banking", "Payment Processing"],
-        "compliance": ["PCI-DSS 3.4", "SOX 302"]
-    },
-    "Payment Processing": {
-        "tier": 1,
-        "rto_hours": 1,
-        "rpo_minutes": 1,
-        "mtpd_hours": 2,
-        "owner": "Payments Team",
-        "dr_strategy": "Hot Standby",
-        "last_dr_test": "2026-03-18",
-        "dr_test_result": "PASSED",
-        "customers": 2_000_000,
-        "hourly_revenue": 3_500_000,
-        "dependencies": [],
-        "compliance": ["PCI-DSS 1.0", "PCI-DSS 3.2", "NACHA Rules"]
-    },
-    "Loan Management": {
-        "tier": 2,
-        "rto_hours": 8,
-        "rpo_minutes": 30,
-        "mtpd_hours": 12,
-        "owner": "Lending Operations",
-        "dr_strategy": "Warm Standby",
-        "last_dr_test": "2026-02-28",
-        "dr_test_result": "PASSED",
-        "customers": 400_000,
-        "hourly_revenue": 500_000,
-        "dependencies": ["Mobile Banking"],
-        "compliance": ["SOX 302", "FDIC Requirements"]
-    },
-    "Investment Services": {
-        "tier": 2,
-        "rto_hours": 8,
-        "rpo_minutes": 60,
-        "mtpd_hours": 24,
-        "owner": "Wealth Management",
-        "dr_strategy": "Warm Standby",
-        "last_dr_test": "2026-02-20",
-        "dr_test_result": "FAILED - Manual Recovery Needed",
-        "customers": 200_000,
-        "hourly_revenue": 300_000,
-        "dependencies": ["Payment Processing"],
-        "compliance": ["SEC 17a-3", "SOX 302"]
-    },
-    "Customer Portal": {
-        "tier": 2,
-        "rto_hours": 12,
-        "rpo_minutes": 120,
-        "mtpd_hours": 24,
-        "owner": "Digital Services",
-        "dr_strategy": "Warm Standby",
-        "last_dr_test": "2026-03-05",
-        "dr_test_result": "PASSED",
-        "customers": 1_500_000,
-        "hourly_revenue": 0,
-        "dependencies": ["Mobile Banking", "Online Transfers"],
-        "compliance": ["GDPR 5.1", "WCAG 2.1"]
-    },
-    "Data Warehouse": {
-        "tier": 3,
-        "rto_hours": 24,
-        "rpo_minutes": 360,
-        "mtpd_hours": 48,
-        "owner": "Analytics Team",
-        "dr_strategy": "Cold Standby",
-        "last_dr_test": "2026-01-30",
-        "dr_test_result": "PASSED",
-        "customers": 0,
-        "hourly_revenue": 0,
-        "dependencies": [],
-        "compliance": ["GDPR 5.1", "Data Residency"]
-    },
-    "Compliance Reporting": {
-        "tier": 3,
-        "rto_hours": 4,
-        "rpo_minutes": 15,
-        "mtpd_hours": 8,
-        "owner": "Compliance Team",
-        "dr_strategy": "Warm Standby",
-        "last_dr_test": "2026-02-14",
-        "dr_test_result": "PASSED",
-        "customers": 0,
-        "hourly_revenue": 0,
-        "dependencies": ["Data Warehouse"],
-        "compliance": ["SOX 302", "FDIC 365.2"]
-    }
-}
+# SERVICE_CATALOG now lives in src/state.py (ServiceCatalogLayer) and is re-exported
+# at the top of this module for backwards compatibility with the tools below.
 
 # RUNBOOK CATALOG
 RUNBOOKS = {
@@ -436,6 +312,8 @@ class CreateIncidentRecordTool(BaseTool):
             bcm_plan_status="ACTIVATED" if priority == "P1" else "MONITORING",
             emergency_change_required=priority == "P1"
         )
+
+        state.operations.register_incident(incident_id, record.model_dump())
 
         return json.dumps(record.model_dump(), indent=2)
 
@@ -723,6 +601,16 @@ class LogLessonTool(BaseTool):
             "logged_timestamp": now.isoformat() + "Z"
         }
 
+        state.kedb.add({
+            "id": remediation_id,
+            "ci_pattern": "incident-derived",
+            "symptom": lesson[:80],
+            "root_cause": pir_output["root_cause"],
+            "workaround": "see PIR remediation",
+            "permanent_fix_planned": due_date,
+            "incidents_caused": 1,
+        })
+
         return json.dumps(pir_output, indent=2)
 
 
@@ -790,53 +678,50 @@ class CheckServiceHealthTool(BaseTool):
 
 
 class QueryCmdbTool(BaseTool):
-    """Configuration Management Database simulation"""
+    """Configuration Management Database — delegates to state.cmdb layer."""
     name: str = "query_cmdb"
     description: str = (
-        "Queries CMDB for configuration items, relationships, ownership, "
-        "environment, last change date, and compliance status."
+        "Queries the CMDB layer for configuration items: relationships, ownership, "
+        "environment, last change ID/timestamp, compliance status, current state. "
+        "Pass a CI name or partial name to look up a specific item, or use keywords "
+        "'relationships'/'dependencies' to traverse the dependency graph."
     )
 
     def _run(self, query: str) -> str:
-        query_lower = query.lower()
+        query_lower = (query or "").lower().strip()
 
-        # Simple query parser
-        if "relationship" in query_lower or "depend" in query_lower:
-            cmdb_result = {
-                "query": query,
-                "results": [
-                    {
-                        "ci_name": "Mobile Banking",
-                        "ci_type": "Application",
-                        "relationships": ["depends_on:Payment Processing", "uses:Customer Portal"],
-                        "owner": "Banking Services Team"
-                    },
-                    {
-                        "ci_name": "Payment Processing",
-                        "ci_type": "Application",
-                        "relationships": ["supports:Mobile Banking", "supports:Online Transfers"],
-                        "owner": "Payments Team"
-                    }
-                ]
-            }
-        else:
-            cmdb_result = {
-                "query": query,
-                "results": [
-                    {
-                        "ci_name": SERVICE_CATALOG[service]["owner"],
-                        "ci_type": "Service",
-                        "owner": SERVICE_CATALOG[service]["owner"],
-                        "environment": "production",
-                        "last_change": "2026-04-10 09:15:00 UTC",
-                        "compliance_status": "compliant",
-                        "tags": ["critical", "pci-dss", "sox"]
-                    }
-                    for service in list(SERVICE_CATALOG.keys())[:3]
-                ]
-            }
+        if any(kw in query_lower for kw in ("relationship", "depend")):
+            results = []
+            for ci_id, ci in state.cmdb.all().items():
+                rels = state.cmdb.find_relationships(ci_id)
+                if rels:
+                    results.append({
+                        "ci_name": ci_id,
+                        "ci_type": ci.get("ci_type"),
+                        "owner": ci.get("owner"),
+                        "relationships": rels,
+                    })
+            return json.dumps({"query": query, "results": results}, indent=2, default=str)
 
-        return json.dumps(cmdb_result, indent=2)
+        ci = state.cmdb.get(query) if query_lower else None
+        if ci:
+            return json.dumps({"query": query, "results": [ci]}, indent=2, default=str)
+
+        results = [
+            {
+                "ci_name": ci.get("ci_id", k),
+                "ci_type": ci.get("ci_type"),
+                "owner": ci.get("owner"),
+                "environment": ci.get("environment"),
+                "last_change_id": ci.get("last_change_id"),
+                "last_change_at": ci.get("last_change_at"),
+                "compliance_status": ci.get("compliance_status"),
+                "tags": ci.get("tags", []),
+                "state": ci.get("state"),
+            }
+            for k, ci in state.cmdb.all().items()
+        ]
+        return json.dumps({"query": query, "results": results}, indent=2, default=str)
 
 
 class ExecuteRunbookTool(BaseTool):

@@ -1,67 +1,157 @@
-# FinServe Digital Bank – BCM Agent Simulation (CrewAI)
+# FinServe Digital Bank – BCM & Change Management Agent Simulation
 
-Production-grade starter repo for the **Agent-Driven Business Continuity Management Challenge**. A multi-agent system that simulates real-world incident response for a fictional digital bank, powered by CrewAI and a local Ollama LLM.
+A multi-agent system that exercises both **incident-driven business continuity** and **planned ITIL change management** for a fictional digital bank, powered by CrewAI and a local Ollama LLM.
 
-## What Students Do
+The repo is intentionally a starter: students customize the agents, tools, and tasks; the simulation engine grades the run.
 
-- Customize the **6 agents** in `src/agents.py` (roles, goals, backstories, tool assignments)
-- Refine the **6 sequential tasks** in `src/tasks.py`
-- Tune the **13 simulation tools** in `src/tools.py`
-- Run `python main.py` when the instructor triggers a live event
-- Agents automatically classify, contain, assess, recover, manage changes, and communicate
-- The **simulation engine** auto-grades the response across 7 scoring dimensions
+## What's modeled
+
+The system runs in two flow shapes selected by the scenario:
+
+| Flow | When it runs | Tasks | Agents that participate |
+|---|---|---|---|
+| **Incident response** (with emergency CAB) | One of the 6 incident scenarios | classify → BIA → contain → recover → emergency CAB (tech review → risk review → decision → PIR) → comms | Detection, Impact, SecOps, Recovery, Comms + the 3 CAB roles |
+| **Standard change** | `standard_cert_rotation` | submit (auto-approved by template) → implement → PIR | Service Owner, CAB Chair |
+| **Normal change** | `normal_db_upgrade` | submit → tech review → risk review → CAB decision → implement → PIR | Service Owner + 3 CAB roles |
+| **Failed change** | `failed_change_rollback` | Same as Normal but `force_backout=true` exercises the rollback path | Service Owner + 3 CAB roles |
+
+## Six named context layers
+
+Earlier versions of this project passed strings between tasks via CrewAI's `context=[task1, task2]` parameter. That worked for incident handoff but it's not what ITIL means by "context." Tools now read from and write to six shared, queryable layers in `src/state.py`:
+
+| Layer | Holds | Mutable? |
+|---|---|---|
+| `services` | Service catalog: RTO/RPO, dependencies, compliance, DR strategy | mostly read |
+| `cmdb` | Configuration Items, relationships, owners, current state | yes — `update()` attributes changes to a `change_id` |
+| `calendar` | All `ChangeRecord` objects, scheduled windows, freeze windows, standard templates | yes — RFCs flow through here |
+| `policy` | Regulatory frameworks → impacted controls per CI tag | static |
+| `operations` | Active incidents, on-call roster, monitoring snapshot | yes |
+| `kedb` | Known Error Database — past failures drive risk scoring | yes — failed changes auto-create entries |
+
+Within one `python main.py` run the layers are module-level singletons, so an RFC submitted by one agent is visible to the reviewer agent on the next task.
+
+## Change record lifecycle
+
+`ChangeRecord` (in `src/models.py`) is an explicit ITIL state machine. Allowed transitions live in `ALLOWED_TRANSITIONS` and are enforced by `ChangeCalendarLayer.transition()` — agents can't teleport states.
+
+```
+DRAFT
+  ↓
+SUBMITTED ─────────────────────────────► REJECTED ──► CLOSED
+  ↓
+UNDER_TECHNICAL_REVIEW
+  ↓
+UNDER_RISK_REVIEW
+  ↓
+AT_CAB
+  ↓
+APPROVED
+  ↓
+SCHEDULED ──► IN_PROGRESS ──► IMPLEMENTED ──► CLOSED
+                            └─► FAILED ──► BACKED_OUT ──► CLOSED
+```
+
+Standard changes auto-promote SUBMITTED → APPROVED inside `submit_rfc` when a `standard_template_id` is provided.
 
 ## Agents
 
-| # | Role | Key Tools |
-|---|------|-----------|
-| 1 | Incident Classification Specialist | analyze_security_event, check_service_health, query_cmdb, create_incident_record |
-| 2 | Business Impact Analyst | calculate_impact, check_compliance_status, assess_vendor_impact, query_cmdb |
-| 3 | Recovery Engineer | check_service_health, query_cmdb, failover_service, execute_runbook, log_lesson |
-| 4 | Stakeholder Communicator | send_notification, coordinate_war_room, check_compliance_status, query_cmdb |
-| 5 | Security Operations (SecOps) Analyst | analyze_security_event, execute_runbook, query_cmdb, check_service_health |
-| 6 | Change & Release Manager | query_cmdb, check_compliance_status, execute_runbook, log_lesson |
+Indices are stable and used by tasks to bind:
 
-## Event Scenarios
+| # | Role | Key change-management tools |
+|---|---|---|
+| 0 | Incident Classification Specialist | — |
+| 1 | Business Impact Analyst | — |
+| 2 | Recovery Engineer | `submit_rfc`, `execute_change`, `update_cmdb` (emergency changes during DR) |
+| 3 | Stakeholder Communicator | — |
+| 4 | Security Operations Analyst | `submit_rfc` (emergency containment changes) |
+| 5 | Service Owner / Change Requester | `submit_rfc`, `execute_change`, `update_cmdb`, `query_change_calendar`, `query_kedb` |
+| 6 | Technical Reviewer (CAB) | `review_rfc_technical`, `query_kedb`, `query_cmdb` |
+| 7 | Risk & Compliance Reviewer (CAB) | `review_rfc_risk`, `query_kedb`, `query_change_calendar`, `check_compliance_status` |
+| 8 | CAB Chair / Change Manager | `cab_decision`, `schedule_change`, `conduct_pir`, `promote_to_standard` |
 
-The instructor selects a scenario by setting `EVENT_SCENARIO` in `main.py`:
+The previous monolithic "Change & Release Manager" was split into agents 6, 7, and 8 to enforce segregation of duties: the requester is not the implementer is not the reviewer is not the approver.
 
-| Scenario | Description |
-|----------|-------------|
-| `ransomware` | LockBit ransomware encrypts primary data center; mobile banking and transfers down |
-| `cloud_outage_ddos` | AWS us-east-1 outage + multi-vector DDoS attack; payment processing at 15% |
-| `data_breach` | Unauthorized access to 2.3M customer records; 47GB exfiltrated |
-| `insider_threat` | Privileged DBA exporting 890GB of customer data over 3 weeks |
-| `supply_chain` | Critical payment processor (PayBridge) compromised via RCE; 1.2M transactions exposed |
-| `cascading_failure` | Failed database migration corrupts transaction ledger; 4 downstream systems affected |
+## Change-management tools
 
-## Scoring Engine
+Defined in `src/change_tools.py`. Each tool returns JSON and mutates the relevant context layer.
 
-`simulation_engine.py` evaluates the crew's response across **7 weighted dimensions** (weights vary by scenario type):
+| Tool | Owner role | Effect |
+|---|---|---|
+| `submit_rfc` | Service Owner / Recovery / SecOps | Creates `ChangeRecord` in `calendar`; auto-approves if standard template |
+| `review_rfc_technical` | Technical Reviewer | Records four-check (impl plan, backout, test evidence, CIs); transitions to UNDER_RISK_REVIEW or REJECTED |
+| `review_rfc_risk` | Risk & Compliance Reviewer | Computes `risk_score = probability × impact / 100`; queries KEDB; checks calendar + freeze; identifies required approvers |
+| `cab_decision` | CAB Chair | Records voting members, conditions, rationale; transitions to APPROVED or REJECTED |
+| `schedule_change` | CAB Chair | Re-validates window; transitions to SCHEDULED or returns conflicts |
+| `execute_change` | Implementer | Pre-checks → CMDB updates (attributed to change_id) → post-checks; `force_backout=true` exercises the rollback path |
+| `update_cmdb` | Implementer | Direct CMDB mutation with change attribution |
+| `query_change_calendar` | Service Owner / Risk Reviewer | Returns window collisions on shared CIs + active freeze windows |
+| `query_kedb` | All reviewers | Returns Known Error Database entries matching CI / symptom |
+| `conduct_pir` | CAB Chair | Records objective_met, side effects, lessons, remediation items; transitions to CLOSED; failed changes seed new KEDB entries |
+| `promote_to_standard` | CAB Chair | Promotes a clean run into a pre-approved template so future identical changes skip full CAB |
 
-1. **Incident Classification** — severity, MITRE ATT&CK mapping, escalation path
-2. **Business Impact Analysis** — RTO/RPO, financial projections, regulatory exposure
-3. **Security Containment** — IOCs, isolation, forensic evidence preservation
-4. **Disaster Recovery** — failover execution, data integrity validation
-5. **Change Management** — emergency CAB approval, rollback planning, audit trail
-6. **Stakeholder Communication** — audience-specific messaging, channel diversity
-7. **Regulatory Compliance** — NIST CSF, ITIL, ISO 22301, FFIEC, PCI-DSS, SOX, GDPR
+## Scenarios
 
-## Frameworks Practiced
+Set `EVENT_SCENARIO` in `main.py`:
 
-NIST CSF, MITRE ATT&CK, ITIL 4 Service Continuity, ISO 22301, FFIEC BCM Handbook, PCI-DSS, SOX, GDPR, Agent-Based Modeling principles.
+| Scenario | Category | What it exercises |
+|---|---|---|
+| `ransomware` | incident | LockBit encryption — full incident response + emergency CAB |
+| `cloud_outage_ddos` | incident | AWS regional outage + DDoS — full incident response |
+| `data_breach` | incident | 2.3M records exfiltrated — GDPR 72h deadline |
+| `insider_threat` | incident | Privileged DBA exfiltration — forensic preservation |
+| `supply_chain` | incident | PayBridge compromise — vendor coordination |
+| `cascading_failure` | incident | Failed DB migration — recovery + change mgmt |
+| `standard_cert_rotation` | standard | Pre-approved cert rotation — uses STD-CERT-001 template; auto-approves |
+| `normal_db_upgrade` | normal | PostgreSQL minor upgrade — full CAB review; agents must avoid month-end freeze (2026-04-28 to 2026-04-30) |
+| `failed_change_rollback` | failed | API gateway deploy that fails post-checks — exercises BACKED_OUT path and KEDB feedback loop |
 
-## Project Structure
+## Scoring
+
+`simulation_engine.py` evaluates against eight dimensions; weights vary by scenario.
+
+**Keyword-based** (text of agent outputs):
+
+1. Incident Classification
+2. Business Impact Analysis
+3. Security Containment
+4. Disaster Recovery
+5. Change Management
+6. Stakeholder Communication
+7. Regulatory Compliance
+
+**Artifact-based** (reads `state.calendar`, `state.cmdb`):
+
+8. **Change Governance** — checks that the lifecycle was actually followed:
+   - Did changes reach a terminal state (IMPLEMENTED / BACKED_OUT / CLOSED)?
+   - Was the CMDB updated with `change_id` attribution?
+   - Were proper artifacts produced for the change category?
+     - **Standard:** template used, auto-approval traversed, PIR conducted
+     - **Normal:** technical review present, risk review with KEDB references, CAB decision with voting members matching the required approver chain, calendar checked
+     - **Emergency:** abbreviated tech + risk reviews, CAB decision, linked incident_id, PIR
+   - Did PIR produce remediation items with owner + due date + priority?
+
+The artifact-based dimension means agents can't earn governance points just by mentioning ITIL words — the underlying state machine must actually have transitioned correctly.
+
+## Frameworks practiced
+
+NIST CSF, MITRE ATT&CK, ITIL 4 Service Continuity & Change Enablement, ISO 22301, FFIEC BCM Handbook, PCI-DSS, SOX, GDPR.
+
+## Project structure
 
 ```
-├── main.py                 # Entry point — select scenario, run crew, auto-grade
-├── simulation_engine.py    # 7-dimension scoring engine
-├── requirements.txt        # Python dependencies
+├── main.py                  # Entry point — select scenario, run crew, auto-grade
+├── simulation_engine.py     # 8-dimension scoring (7 keyword + 1 artifact-based)
+├── requirements.txt
+├── scripts/
+│   └── smoke_test.py        # Drives the lifecycle without an LLM (fast)
 ├── src/
-│   ├── agents.py           # 6 BCM agents with Ollama LLM config
-│   ├── tasks.py            # 6 sequential tasks with context chaining
-│   ├── bcm_crew.py         # Crew assembly (sequential process)
-│   └── tools.py            # 13 simulation tools with structured Pydantic outputs
+│   ├── agents.py            # 9 agents (5 incident + 1 service owner + 3 CAB roles)
+│   ├── tasks.py             # INCIDENT_TASKS / NORMAL_CHANGE_TASKS / STANDARD_CHANGE_TASKS
+│   ├── bcm_crew.py          # Crew factory; branches on scenario category
+│   ├── tools.py             # Existing 13 incident-response tools (now read from state layers)
+│   ├── change_tools.py      # 11 change-management tools (submit/review/CAB/schedule/execute/PIR)
+│   ├── models.py            # ChangeRecord, ChangeState, RiskLevel, PIRRecord, etc.
+│   └── state.py             # 6 named context layers as singletons
 ```
 
 ## Setup
@@ -69,43 +159,43 @@ NIST CSF, MITRE ATT&CK, ITIL 4 Service Continuity, ISO 22301, FFIEC BCM Handbook
 ### Prerequisites
 
 - Python 3.10+
-- [Ollama](https://ollama.com/) running locally with the `qwen3:8b-q4_K_M` model
+- [Ollama](https://ollama.com/) running locally with `qwen3:8b-q4_K_M`
 
 ### Installation
 
-1. Clone the repo:
-   ```bash
-   git clone https://github.com/cocheuno/itsm-devops-bcm-crewai-starter.git
-   cd itsm-devops-bcm-crewai-starter
-   ```
+```bash
+git clone https://github.com/cocheuno/itsm-devops-bcm-crewai-starter.git
+cd itsm-devops-bcm-crewai-starter
+pip install -r requirements.txt
+ollama pull qwen3:8b-q4_K_M
+```
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### Run
 
-3. Pull the Ollama model:
-   ```bash
-   ollama pull qwen3:8b-q4_K_M
-   ```
+```bash
+python main.py
+```
 
-4. Make sure Ollama is running (`ollama serve` or the Ollama desktop app).
+Edit `EVENT_SCENARIO` in `main.py` to switch scenarios.
 
-5. Run:
-   ```bash
-   python main.py
-   ```
+### Validate without an LLM
+
+`scripts/smoke_test.py` drives the change-tools through their lifecycle directly and runs the simulation engine against the resulting state — fast confirmation that the state machine and scoring are wired correctly:
+
+```bash
+python scripts/smoke_test.py
+```
 
 ### Switching the LLM
 
-To use a different model, edit the `ollama_llm` configuration in `src/agents.py`:
+Edit `ollama_llm` in `src/agents.py`:
 
 ```python
 ollama_llm = LLM(
-    model="ollama/qwen3:8b-q4_K_M",   # change model here
-    base_url="http://localhost:11434",  # Ollama default
-    timeout=1200
+    model="ollama/qwen3:8b-q4_K_M",
+    base_url="http://localhost:11434",
+    timeout=1200,
 )
 ```
 
-To use Groq or OpenAI instead, replace with `LLM(model="groq/...")` or `LLM(model="gpt-...")` and set the appropriate API key in a `.env` file.
+For Groq or OpenAI, replace with `LLM(model="groq/...")` or `LLM(model="gpt-...")` and set the appropriate API key in a `.env` file.
