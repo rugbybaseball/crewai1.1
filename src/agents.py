@@ -9,6 +9,7 @@ from src.change_tools import (
     submit_rfc, review_rfc_technical, review_rfc_risk, cab_decision,
     schedule_change, query_change_calendar, execute_change, update_cmdb,
     query_kedb, conduct_pir, promote_to_standard,
+    query_license_catalog, check_budget, submit_license_request, route_license_request,
 )
 
 ollama_llm = LLM(
@@ -33,6 +34,8 @@ def create_agents():
       6  technical_reviewer_agent     (change scenarios — technical CAB review)
       7  risk_compliance_agent        (change scenarios — risk & compliance CAB review)
       8  cab_chair_agent              (all scenarios w/ changes — CAB decision + PIR)
+      9  license_approval_router_agent (Phase 2 service-request scenario — single
+                                        decision: auto-approve OR route to manager)
     """
 
     detection_agent = Agent(
@@ -261,14 +264,55 @@ def create_agents():
         allow_delegation=False,
     )
 
+    # Phase 2: License Approval Router — the single decision agent for the
+    # Software License service-request scenario. Scope is narrow on purpose:
+    # the router observes a submitted LicenseRequestRecord, applies three
+    # deterministic gates (cost, role-match, budget), and produces ONE of
+    # two terminal statuses (auto-approve & provision, or pending manager).
+    # The router stops at the routing decision — the manager's eventual
+    # decision is out of scope.
+    license_approval_router_agent = Agent(
+        role="Software License Approval Router",
+        goal=(
+            "For each incoming software-license service request, decide whether to AUTO-APPROVE "
+            "and provision via the standard template, or ROUTE TO MANAGER for manual review. "
+            "Methodology: (1) call query_license_catalog to confirm SKU cost, eligible roles, and "
+            "enterprise_cap; (2) call check_budget for the department; (3) call route_license_request "
+            "which applies the three gates (cost <= $500/seat/year, role match, budget headroom) "
+            "plus the hard guards (enterprise_cap, circuit_breaker) and transitions state. "
+            "Stop after route_license_request — that is the Phase 1 stopping point. "
+            "DO NOT approve anything that would breach the enterprise license cap or trigger the "
+            "department circuit breaker, regardless of cost."
+        ),
+        backstory=(
+            "You are the Service Request Fulfillment Router that sits between the ServiceNow "
+            "self-service portal and the SaaS provisioning APIs. You exist because IT Finance got "
+            "tired of paying for $1,000 IDEs for non-developers and IT Service Desk got tired of "
+            "manually triaging $20 collaboration tools. You are deterministic and auditable: every "
+            "routing decision has gate-by-gate justification in the audit log. You understand the "
+            "second-order risks — uncontrolled provisioning blows budgets and breaches enterprise "
+            "license agreements, and a single bad batch can cause Finance to freeze all automated "
+            "approvals. You err on the side of routing to a human when ANY gate fails."
+        ),
+        tools=[
+            query_license_catalog, check_budget,
+            submit_license_request, route_license_request,
+            query_cmdb, query_change_calendar,
+        ],
+        verbose=True,
+        llm=ollama_llm,
+        allow_delegation=False,
+    )
+
     return [
-        detection_agent,           # 0
-        impact_agent,              # 1
-        recovery_agent,            # 2
-        comms_agent,               # 3
-        secops_agent,              # 4
-        service_owner_agent,       # 5
-        technical_reviewer_agent,  # 6
-        risk_compliance_agent,     # 7
-        cab_chair_agent,           # 8
+        detection_agent,                # 0
+        impact_agent,                   # 1
+        recovery_agent,                 # 2
+        comms_agent,                    # 3
+        secops_agent,                   # 4
+        service_owner_agent,            # 5
+        technical_reviewer_agent,       # 6
+        risk_compliance_agent,          # 7
+        cab_chair_agent,                # 8
+        license_approval_router_agent,  # 9
     ]

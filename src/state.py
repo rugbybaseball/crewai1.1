@@ -28,6 +28,7 @@ from src.models import (
     ChangeRecord,
     ChangeState,
     FreezeWindow,
+    LicenseRequestRecord,
     StandardChangeTemplate,
     StateTransition,
     ALLOWED_TRANSITIONS,
@@ -198,6 +199,23 @@ class CMDBLayer:
         ci["last_change_at"] = datetime.utcnow().isoformat() + "Z"
         return ci
 
+    def add_ci(self, ci_id: str, ci_attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """Register a new Configuration Item. Used when a change creates a new CI
+        (e.g., a license allocation entry produced by the Phase 2 router)."""
+        if ci_id in self._cis:
+            return self._cis[ci_id]
+        self._cis[ci_id] = {
+            "ci_id": ci_id,
+            "environment": "production",
+            "last_change_id": ci_attrs.get("last_change_id"),
+            "last_change_at": datetime.utcnow().isoformat() + "Z",
+            "compliance_status": "compliant",
+            "relationships": [],
+            "state": "operational",
+            **ci_attrs,
+        }
+        return self._cis[ci_id]
+
     def find_relationships(self, ci_id: str) -> List[Dict[str, Any]]:
         ci = self.get(ci_id)
         if not ci:
@@ -280,6 +298,40 @@ def _seed_standard_templates() -> Dict[str, StandardChangeTemplate]:
             risk_level=RiskLevel.LOW,
             affected_ci_pattern="*",
             times_used=89,
+        ),
+        # Phase 2: pre-approved standard templates for low-cost, role-matched
+        # software-license requests. The Auto-Approval Router uses these to
+        # auto-approve in-bounds requests; out-of-bounds requests fall through
+        # to manual manager review.
+        "STD-LIC-COLLAB-001": StandardChangeTemplate(
+            template_id="STD-LIC-COLLAB-001",
+            title="Standard collaboration tool license (Slack/Zoom/Notion)",
+            description="Pre-approved seat for any employee role; cost <= $500/year.",
+            typical_duration_minutes=5,
+            backout_plan="Revoke license via SaaS admin API.",
+            risk_level=RiskLevel.LOW,
+            affected_ci_pattern="LIC-COLLAB-*",
+            times_used=312,
+        ),
+        "STD-LIC-DESIGN-001": StandardChangeTemplate(
+            template_id="STD-LIC-DESIGN-001",
+            title="Designer/marketing creative license",
+            description="Adobe Creative Cloud or equivalent for design/marketing roles only.",
+            typical_duration_minutes=10,
+            backout_plan="Revoke license via SaaS admin API.",
+            risk_level=RiskLevel.LOW,
+            affected_ci_pattern="LIC-DESIGN-*",
+            times_used=84,
+        ),
+        "STD-LIC-DEV-001": StandardChangeTemplate(
+            template_id="STD-LIC-DEV-001",
+            title="Developer IDE / language tooling license",
+            description="JetBrains/VS Code paid features for developer roles only.",
+            typical_duration_minutes=10,
+            backout_plan="Revoke license via SaaS admin API.",
+            risk_level=RiskLevel.LOW,
+            affected_ci_pattern="LIC-DEV-*",
+            times_used=156,
         ),
     }
 
@@ -612,6 +664,201 @@ class KEDBLayer:
 
 
 # ---------------------------------------------------------------------------
+# Layer 7: License Catalog (Phase 2 — service-request scenario)
+# ---------------------------------------------------------------------------
+#
+# SKU metadata for the Software License Approval Router. Each SKU declares:
+#   - cost_per_seat_year: drives the cost gate (auto-threshold = $500)
+#   - eligible_roles: drives the role-match gate
+#   - enterprise_cap: ELA seat limit; auto-approval must NEVER exceed this
+#                     regardless of cost (the second-order vendor true-up risk)
+#   - template_id: the STD-LIC-* template used on auto-approval
+#   - compliance_tags: feeds the policy layer (PII processors trigger GDPR review)
+
+
+LICENSE_CATALOG: Dict[str, Dict[str, Any]] = {
+    "ADOBE-CC-FULL": {
+        "name": "Adobe Creative Cloud (All Apps)",
+        "cost_per_seat_year": 720.0,
+        "eligible_roles": ["designer", "marketing", "creative"],
+        "enterprise_cap": 50,
+        "template_id": "STD-LIC-DESIGN-001",
+        "compliance_tags": [],
+    },
+    "ADOBE-ACROBAT-STD": {
+        "name": "Adobe Acrobat Standard",
+        "cost_per_seat_year": 180.0,
+        "eligible_roles": ["*"],  # any role
+        "enterprise_cap": 500,
+        "template_id": "STD-LIC-COLLAB-001",
+        "compliance_tags": [],
+    },
+    "JETBRAINS-IDEA-ULT": {
+        "name": "JetBrains IntelliJ IDEA Ultimate",
+        "cost_per_seat_year": 1000.0,
+        "eligible_roles": ["developer", "engineer", "sre"],
+        "enterprise_cap": 200,
+        "template_id": "STD-LIC-DEV-001",
+        "compliance_tags": [],
+    },
+    "SLACK-BUSINESS-PLUS": {
+        "name": "Slack Business+ seat",
+        "cost_per_seat_year": 180.0,
+        "eligible_roles": ["*"],
+        "enterprise_cap": 2000,
+        "template_id": "STD-LIC-COLLAB-001",
+        "compliance_tags": [],
+    },
+    "ZOOM-PRO": {
+        "name": "Zoom Pro seat",
+        "cost_per_seat_year": 150.0,
+        "eligible_roles": ["*"],
+        "enterprise_cap": 1500,
+        "template_id": "STD-LIC-COLLAB-001",
+        "compliance_tags": [],
+    },
+    "SALESFORCE-CRM-ENT": {
+        "name": "Salesforce CRM Enterprise",
+        "cost_per_seat_year": 1800.0,
+        "eligible_roles": ["sales", "account-manager"],
+        "enterprise_cap": 120,
+        "template_id": "STD-LIC-COLLAB-001",
+        "compliance_tags": ["personal-data", "gdpr"],
+    },
+}
+
+
+class LicenseCatalogLayer:
+    """Read-mostly catalog of license SKUs with cost, role eligibility, ELA caps."""
+
+    AUTO_APPROVE_COST_THRESHOLD: float = 500.0  # Phase 1 success criterion
+
+    def __init__(self) -> None:
+        self._catalog = deepcopy(LICENSE_CATALOG)
+        # seats_in_use is mutable — every auto-approved IMPLEMENTED request increments
+        self._seats_in_use: Dict[str, int] = {sku: 0 for sku in self._catalog}
+
+    def get(self, sku: str) -> Optional[Dict[str, Any]]:
+        return self._catalog.get(sku.upper())
+
+    def all_skus(self) -> List[str]:
+        return list(self._catalog.keys())
+
+    def role_eligible(self, sku: str, role: str) -> bool:
+        meta = self.get(sku)
+        if not meta:
+            return False
+        eligible = [r.lower() for r in meta["eligible_roles"]]
+        if "*" in eligible:
+            return True
+        return role.lower() in eligible
+
+    def seats_in_use(self, sku: str) -> int:
+        return self._seats_in_use.get(sku.upper(), 0)
+
+    def reserve_seats(self, sku: str, seats: int) -> int:
+        """Increment in-use seat count (called on auto-approve IMPLEMENTED)."""
+        sku_u = sku.upper()
+        self._seats_in_use[sku_u] = self._seats_in_use.get(sku_u, 0) + seats
+        return self._seats_in_use[sku_u]
+
+    def would_exceed_enterprise_cap(self, sku: str, additional_seats: int) -> bool:
+        meta = self.get(sku)
+        if not meta:
+            return False
+        cap = meta.get("enterprise_cap")
+        if cap is None:
+            return False
+        return (self.seats_in_use(sku) + additional_seats) > cap
+
+
+# ---------------------------------------------------------------------------
+# Layer 8: Budget (Phase 2)
+# ---------------------------------------------------------------------------
+#
+# Per-department monthly software pool. The router checks headroom before
+# auto-approving. The circuit-breaker fires when cumulative auto-approved
+# spend exceeds 110% of forecast — the Phase 1 second-order failure mode.
+
+
+DEPARTMENT_BUDGETS: Dict[str, Dict[str, float]] = {
+    "engineering":   {"monthly_pool": 25000.0, "forecast": 22000.0, "spent": 0.0},
+    "design":        {"monthly_pool": 8000.0,  "forecast": 7000.0,  "spent": 0.0},
+    "marketing":     {"monthly_pool": 10000.0, "forecast": 9000.0,  "spent": 0.0},
+    "sales":         {"monthly_pool": 20000.0, "forecast": 18000.0, "spent": 0.0},
+    "operations":    {"monthly_pool": 6000.0,  "forecast": 5000.0,  "spent": 0.0},
+    "finance":       {"monthly_pool": 5000.0,  "forecast": 4500.0,  "spent": 0.0},
+}
+
+
+class BudgetLayer:
+    """Departmental software-license budget pools with running spend ledger."""
+
+    CIRCUIT_BREAKER_PCT: float = 1.10  # 110% of forecast triggers freeze
+
+    def __init__(self) -> None:
+        self._budgets = deepcopy(DEPARTMENT_BUDGETS)
+        self._circuit_breaker_tripped: Dict[str, bool] = {d: False for d in self._budgets}
+
+    def get(self, department: str) -> Optional[Dict[str, float]]:
+        return self._budgets.get(department.lower())
+
+    def forecast_for(self, department: str) -> Optional[float]:
+        b = self.get(department)
+        return b["forecast"] if b else None
+
+    def headroom(self, department: str) -> Optional[float]:
+        b = self.get(department)
+        if not b:
+            return None
+        return b["monthly_pool"] - b["spent"]
+
+    def would_overrun(self, department: str, cost: float) -> bool:
+        h = self.headroom(department)
+        return h is None or cost > h
+
+    def charge(self, department: str, cost: float) -> Dict[str, float]:
+        """Add to spent ledger. Called on auto-approved IMPLEMENTED requests."""
+        b = self.get(department)
+        if not b:
+            return {"error": -1}
+        b["spent"] += cost
+        if b["spent"] > b["forecast"] * self.CIRCUIT_BREAKER_PCT:
+            self._circuit_breaker_tripped[department.lower()] = True
+        return dict(b)
+
+    def circuit_breaker_active(self, department: str) -> bool:
+        return self._circuit_breaker_tripped.get(department.lower(), False)
+
+
+# ---------------------------------------------------------------------------
+# Layer 9: Service Request Registry (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class ServiceRequestRegistryLayer:
+    """Holds LicenseRequestRecord audit objects keyed by request_id."""
+
+    def __init__(self) -> None:
+        self._requests: Dict[str, LicenseRequestRecord] = {}
+
+    def add(self, record: LicenseRequestRecord) -> None:
+        self._requests[record.request_id] = record
+
+    def get(self, request_id: str) -> Optional[LicenseRequestRecord]:
+        return self._requests.get(request_id)
+
+    def get_by_change_id(self, change_id: str) -> Optional[LicenseRequestRecord]:
+        for r in self._requests.values():
+            if r.change_id == change_id:
+                return r
+        return None
+
+    def all(self) -> List[LicenseRequestRecord]:
+        return list(self._requests.values())
+
+
+# ---------------------------------------------------------------------------
 # Module-level singletons
 # ---------------------------------------------------------------------------
 
@@ -621,14 +868,21 @@ calendar = ChangeCalendarLayer()
 policy = PolicyRegistryLayer()
 operations = OperationalStateLayer()
 kedb = KEDBLayer()
+license_catalog = LicenseCatalogLayer()
+budget = BudgetLayer()
+service_requests = ServiceRequestRegistryLayer()
 
 
 def reset_state() -> None:
     """Reinitialize all layers — useful for tests/demos that run multiple scenarios."""
     global services, cmdb, calendar, policy, operations, kedb
+    global license_catalog, budget, service_requests
     services = ServiceCatalogLayer()
     cmdb = CMDBLayer(services)
     calendar = ChangeCalendarLayer()
     policy = PolicyRegistryLayer()
     operations = OperationalStateLayer()
     kedb = KEDBLayer()
+    license_catalog = LicenseCatalogLayer()
+    budget = BudgetLayer()
+    service_requests = ServiceRequestRegistryLayer()

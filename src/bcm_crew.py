@@ -18,6 +18,7 @@ from src.tasks import (
     NORMAL_CHANGE_TASKS,
     STANDARD_CHANGE_TASKS,
     FAILED_CHANGE_TASKS,
+    SERVICE_REQUEST_TASKS,
 )
 
 
@@ -36,6 +37,8 @@ SCENARIO_CATEGORY = {
     "normal_db_upgrade": "normal",
     # Planned change that fails post-checks and exercises the backout path
     "failed_change_rollback": "failed",
+    # Phase 2: Automated Software License Approval (Service Request fulfillment)
+    "software_license_request": "service_request",
 }
 
 
@@ -45,6 +48,7 @@ def _tasks_for_category(category: str):
         "standard": STANDARD_CHANGE_TASKS,
         "normal": NORMAL_CHANGE_TASKS,
         "failed": FAILED_CHANGE_TASKS,
+        "service_request": SERVICE_REQUEST_TASKS,
     }[category]
 
 

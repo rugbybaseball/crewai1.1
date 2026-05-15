@@ -203,3 +203,52 @@ class StandardChangeTemplate(BaseModel):
     risk_level: RiskLevel
     affected_ci_pattern: str  # e.g. "*_cert", "tier-2-*"
     times_used: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Service Request: Automated Software License Approval
+# ---------------------------------------------------------------------------
+#
+# A LicenseRequestRecord is the service-request-side audit object that pairs
+# with a ChangeRecord. The ChangeRecord drives the ITIL state machine; the
+# LicenseRequestRecord captures the license-specific metadata (SKU, cost,
+# role, department) and the routing decision the agent under test produced.
+#
+# Linkage: LicenseRequestRecord.change_id -> ChangeRecord.change_id
+
+
+class ServiceRequestCategory(str, Enum):
+    SOFTWARE_LICENSE = "software_license"
+
+
+class RoutingDecision(str, Enum):
+    AUTO_APPROVE = "auto_approve"
+    ROUTE_TO_MANAGER = "route_to_manager"
+
+
+class GateResult(BaseModel):
+    """One gate's pass/fail with the actual values the gate compared."""
+    name: str  # "cost" | "role_match" | "budget" | "enterprise_cap"
+    passed: bool
+    detail: str
+
+
+class LicenseRequestRecord(BaseModel):
+    """Service-request payload for an Automated Software License Approval flow."""
+    request_id: str
+    change_id: str  # foreign key to ChangeRecord in state.calendar
+    category: ServiceRequestCategory = ServiceRequestCategory.SOFTWARE_LICENSE
+    requester: str
+    requester_role: str  # e.g. "designer", "non-developer", "analyst"
+    department: str
+    license_sku: str
+    cost_per_seat_year: float
+    seats: int = 1
+    decision: Optional[RoutingDecision] = None
+    decision_reasons: List[str] = Field(default_factory=list)
+    gate_results: List[GateResult] = Field(default_factory=list)
+    pending_manager_approval: bool = False
+    circuit_breaker_active: bool = False
+    submitted_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    decided_at: Optional[str] = None
+    latency_ms: Optional[int] = None

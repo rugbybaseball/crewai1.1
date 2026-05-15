@@ -23,12 +23,15 @@ from src.models import (
     ChangeRecord,
     ChangeState,
     CABDecision,
+    GateResult,
     ImplementationResult,
+    LicenseRequestRecord,
     PIRRecord,
     RemediationItem,
     ReviewDecision,
     RiskLevel,
     RiskReview,
+    RoutingDecision,
     StandardChangeTemplate,
     TechnicalReview,
 )
@@ -695,6 +698,307 @@ class PromoteToStandardTool(BaseTool):
         )
         state.calendar.add_template(tpl)
         return tpl.model_dump_json(indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Service Request: Automated Software License Approval Router
+# ---------------------------------------------------------------------------
+#
+# Four tools that wire the Phase 1 scenario into the existing state machine:
+#
+#   query_license_catalog   — SKU metadata
+#   check_budget            — department headroom + circuit-breaker status
+#   submit_license_request  — create paired ChangeRecord + LicenseRequestRecord
+#   route_license_request   — THE decision moment: apply 3 gates, transition
+#                             state, record gate_results + latency + audit
+#
+# The router agent (idx 9) calls them in that order; the smoke test calls them
+# directly without an LLM to validate the falsifiable success criteria.
+
+
+def _gen_request_id() -> str:
+    h = hashlib.md5(f"{datetime.utcnow().isoformat()}{datetime.utcnow().microsecond}".encode()).hexdigest()[:5].upper()
+    return f"SR-LIC-{datetime.utcnow().strftime('%Y%m%d')}-{h}"
+
+
+class QueryLicenseCatalogTool(BaseTool):
+    name: str = "query_license_catalog"
+    description: str = (
+        "Look up a software license SKU in the catalog. Returns cost_per_seat_year, "
+        "eligible_roles, enterprise_cap (seat limit), seats_in_use today, the matching "
+        "STD-LIC-* template_id used on auto-approval, and any compliance_tags. "
+        "Use this BEFORE routing to know whether the SKU is auto-approvable for the requester."
+    )
+
+    def _run(self, sku: str) -> str:
+        meta = state.license_catalog.get(sku)
+        if not meta:
+            return json.dumps({"error": f"Unknown SKU: {sku}", "known_skus": state.license_catalog.all_skus()})
+        return json.dumps({
+            "sku": sku.upper(),
+            "name": meta["name"],
+            "cost_per_seat_year": meta["cost_per_seat_year"],
+            "eligible_roles": meta["eligible_roles"],
+            "enterprise_cap": meta["enterprise_cap"],
+            "seats_in_use": state.license_catalog.seats_in_use(sku),
+            "template_id": meta["template_id"],
+            "compliance_tags": meta["compliance_tags"],
+            "auto_approve_cost_threshold": state.license_catalog.AUTO_APPROVE_COST_THRESHOLD,
+        }, indent=2)
+
+
+class CheckBudgetTool(BaseTool):
+    name: str = "check_budget"
+    description: str = (
+        "Check a department's software-license budget. Returns monthly_pool, forecast, "
+        "current spent, headroom, would_overrun flag for the given cost, and "
+        "circuit_breaker_active flag (true once cumulative spend exceeds 110% of forecast). "
+        "If circuit_breaker_active is true, the router MUST route to manager regardless of cost."
+    )
+
+    def _run(self, department: str, cost: float = 0.0) -> str:
+        b = state.budget.get(department)
+        if not b:
+            return json.dumps({"error": f"Unknown department: {department}",
+                               "known_departments": list(state.budget._budgets.keys())})
+        return json.dumps({
+            "department": department.lower(),
+            "monthly_pool": b["monthly_pool"],
+            "forecast": b["forecast"],
+            "spent": b["spent"],
+            "headroom": state.budget.headroom(department),
+            "would_overrun": state.budget.would_overrun(department, float(cost)),
+            "circuit_breaker_active": state.budget.circuit_breaker_active(department),
+            "circuit_breaker_pct": state.budget.CIRCUIT_BREAKER_PCT,
+        }, indent=2)
+
+
+class SubmitLicenseRequestTool(BaseTool):
+    name: str = "submit_license_request"
+    description: str = (
+        "Intake: create a paired ChangeRecord + LicenseRequestRecord for a software-license "
+        "service request. Creates the ChangeRecord (category=normal, state=SUBMITTED) and the "
+        "linked LicenseRequestRecord (category=software_license) in one call. "
+        "Returns the request_id and change_id — pass BOTH to route_license_request next."
+    )
+
+    def _run(
+        self,
+        requester: str,
+        requester_role: str,
+        department: str,
+        license_sku: str,
+        seats: int = 1,
+    ) -> str:
+        sku_meta = state.license_catalog.get(license_sku)
+        if not sku_meta:
+            return json.dumps({"error": f"Unknown SKU: {license_sku}"})
+
+        cost = float(sku_meta["cost_per_seat_year"]) * int(seats)
+        ci_id = f"LIC-{license_sku.upper()}"
+
+        change_id = _gen_change_id(ChangeCategory.NORMAL, f"license-{license_sku}-{requester}")
+        change = ChangeRecord(
+            change_id=change_id,
+            category=ChangeCategory.NORMAL,
+            title=f"License request: {sku_meta['name']} for {requester}",
+            description=(
+                f"Service request for {seats} seat(s) of {license_sku} ({sku_meta['name']}). "
+                f"Requester role: {requester_role}; department: {department}; "
+                f"annual cost: ${cost:.2f}."
+            ),
+            requester=requester,
+            implementer="AutoProvisioning",
+            affected_cis=[ci_id],
+            backout_plan=f"Revoke license seat for {requester} via SaaS admin API.",
+            test_evidence=[],
+            standard_template_id=sku_meta["template_id"],
+        )
+        state.calendar.add_change(change)
+        state.calendar.transition(change_id, ChangeState.SUBMITTED, actor=requester,
+                                  notes="License service request intake")
+
+        request_id = _gen_request_id()
+        lr = LicenseRequestRecord(
+            request_id=request_id,
+            change_id=change_id,
+            requester=requester,
+            requester_role=requester_role,
+            department=department.lower(),
+            license_sku=license_sku.upper(),
+            cost_per_seat_year=float(sku_meta["cost_per_seat_year"]),
+            seats=int(seats),
+        )
+        state.service_requests.add(lr)
+
+        return json.dumps({
+            "request_id": request_id,
+            "change_id": change_id,
+            "license_sku": lr.license_sku,
+            "seats": lr.seats,
+            "annual_cost": cost,
+            "applicable_template": sku_meta["template_id"],
+            "state": ChangeState.SUBMITTED.value,
+            "submitted_at": lr.submitted_at,
+        }, indent=2)
+
+
+class RouteLicenseRequestTool(BaseTool):
+    name: str = "route_license_request"
+    description: str = (
+        "THE decision moment — the Phase 1 agent. Apply three deterministic gates "
+        "(cost, role-match, budget) plus the enterprise-cap and circuit-breaker checks, "
+        "then transition the linked ChangeRecord state. "
+        "Auto-approve path: SUBMITTED -> ... -> IMPLEMENTED + CMDB allocation + budget charge. "
+        "Manager path: SUBMITTED -> UNDER_TECHNICAL_REVIEW -> UNDER_RISK_REVIEW + "
+        "pending_manager_approval=true. "
+        "Returns the LicenseRequestRecord with gate_results, decision, decision_reasons, "
+        "decided_at, and latency_ms. Stop after this — that is the Phase 1 stopping point."
+    )
+
+    def _run(self, request_id: str) -> str:
+        lr = state.service_requests.get(request_id)
+        if lr is None:
+            return json.dumps({"error": f"License request not found: {request_id}"})
+        change = state.calendar.get_change(lr.change_id)
+        if change is None:
+            return json.dumps({"error": f"Linked change not found: {lr.change_id}"})
+
+        sku_meta = state.license_catalog.get(lr.license_sku)
+        if not sku_meta:
+            return json.dumps({"error": f"SKU vanished from catalog: {lr.license_sku}"})
+
+        annual_cost = lr.cost_per_seat_year * lr.seats
+        gates: List[GateResult] = []
+
+        # Gate 1: cost ceiling
+        cost_passes = annual_cost <= state.license_catalog.AUTO_APPROVE_COST_THRESHOLD
+        gates.append(GateResult(
+            name="cost",
+            passed=cost_passes,
+            detail=(f"annual_cost=${annual_cost:.2f} "
+                    f"threshold=${state.license_catalog.AUTO_APPROVE_COST_THRESHOLD:.2f}"),
+        ))
+
+        # Gate 2: role match
+        role_passes = state.license_catalog.role_eligible(lr.license_sku, lr.requester_role)
+        gates.append(GateResult(
+            name="role_match",
+            passed=role_passes,
+            detail=(f"role='{lr.requester_role}' eligible={sku_meta['eligible_roles']}"),
+        ))
+
+        # Gate 3: budget headroom
+        budget_overrun = state.budget.would_overrun(lr.department, annual_cost)
+        budget_passes = not budget_overrun
+        b = state.budget.get(lr.department) or {}
+        gates.append(GateResult(
+            name="budget",
+            passed=budget_passes,
+            detail=(f"department='{lr.department}' headroom=${state.budget.headroom(lr.department)} "
+                    f"requested=${annual_cost:.2f}"),
+        ))
+
+        # Hard guards (second-order failure modes):
+        ela_breach = state.license_catalog.would_exceed_enterprise_cap(lr.license_sku, lr.seats)
+        breaker_active = state.budget.circuit_breaker_active(lr.department)
+        if ela_breach:
+            gates.append(GateResult(
+                name="enterprise_cap",
+                passed=False,
+                detail=(f"sku={lr.license_sku} would exceed enterprise_cap="
+                        f"{sku_meta.get('enterprise_cap')} (in_use="
+                        f"{state.license_catalog.seats_in_use(lr.license_sku)}, requested={lr.seats})"),
+            ))
+        if breaker_active:
+            gates.append(GateResult(
+                name="circuit_breaker",
+                passed=False,
+                detail=f"department '{lr.department}' breaker tripped — all to manual until reset",
+            ))
+
+        all_passed = all(g.passed for g in gates)
+        reasons = [f"{g.name}:{'PASS' if g.passed else 'FAIL'} ({g.detail})" for g in gates]
+
+        if all_passed:
+            decision = RoutingDecision.AUTO_APPROVE
+            # Drive the change through to IMPLEMENTED. The standard_template_id is set
+            # on the change at intake, but we did NOT auto-approve at submit time —
+            # the router owns the decision. We now walk the state machine explicitly.
+            state.calendar.transition(lr.change_id, ChangeState.UNDER_TECHNICAL_REVIEW,
+                                      actor="LicenseApprovalRouter",
+                                      notes="Auto-approval router — template match")
+            state.calendar.transition(lr.change_id, ChangeState.UNDER_RISK_REVIEW,
+                                      actor="LicenseApprovalRouter",
+                                      notes="Pre-approved risk profile (template)")
+            state.calendar.transition(lr.change_id, ChangeState.AT_CAB,
+                                      actor="LicenseApprovalRouter",
+                                      notes="Standard template pre-approval")
+            state.calendar.transition(lr.change_id, ChangeState.APPROVED,
+                                      actor="LicenseApprovalRouter",
+                                      notes=f"Auto-approved via {sku_meta['template_id']}")
+            state.calendar.transition(lr.change_id, ChangeState.IN_PROGRESS,
+                                      actor="AutoProvisioning",
+                                      notes="Provisioning seat via SaaS admin API")
+            # CMDB allocation entry, attributed to change_id
+            state.cmdb.add_ci(change.affected_cis[0], {
+                "ci_type": "License Allocation",
+                "owner": lr.department,
+                "current_version": f"{lr.license_sku} x{lr.seats}",
+                "last_change_id": lr.change_id,
+                "tags": ["license"] + list(sku_meta.get("compliance_tags", [])),
+                "assigned_to": lr.requester,
+                "annual_cost": annual_cost,
+            })
+            state.calendar.transition(lr.change_id, ChangeState.IMPLEMENTED,
+                                      actor="AutoProvisioning",
+                                      notes="Seat provisioned; CMDB allocation written")
+            state.license_catalog.reserve_seats(lr.license_sku, lr.seats)
+            state.budget.charge(lr.department, annual_cost)
+            change.implementation_result = ImplementationResult(
+                implementer="AutoProvisioning",
+                started_at=_now(),
+                completed_at=_now(),
+                pre_check_results={"catalog": "ok", "budget": "ok", "role": "ok"},
+                steps_executed=[
+                    {"step": 1, "action": f"Provision {lr.license_sku} for {lr.requester}",
+                     "status": "success", "timestamp": "T+0s"},
+                ],
+                post_check_results={"seat_active": True},
+                cmdb_updated=True,
+                backout_required=False,
+                outcome="success",
+            )
+            lr.pending_manager_approval = False
+        else:
+            decision = RoutingDecision.ROUTE_TO_MANAGER
+            state.calendar.transition(lr.change_id, ChangeState.UNDER_TECHNICAL_REVIEW,
+                                      actor="LicenseApprovalRouter",
+                                      notes="Out-of-template — routing to manager")
+            state.calendar.transition(lr.change_id, ChangeState.UNDER_RISK_REVIEW,
+                                      actor="LicenseApprovalRouter",
+                                      notes="Pending manager approval")
+            lr.pending_manager_approval = True
+
+        lr.decision = decision
+        lr.decision_reasons = reasons
+        lr.gate_results = gates
+        lr.circuit_breaker_active = breaker_active
+        lr.decided_at = _now()
+        try:
+            submitted_dt = datetime.fromisoformat(lr.submitted_at.replace("Z", ""))
+            decided_dt = datetime.fromisoformat(lr.decided_at.replace("Z", ""))
+            lr.latency_ms = int((decided_dt - submitted_dt).total_seconds() * 1000)
+        except ValueError:
+            lr.latency_ms = None
+
+        return lr.model_dump_json(indent=2)
+
+
+query_license_catalog = QueryLicenseCatalogTool()
+check_budget = CheckBudgetTool()
+submit_license_request = SubmitLicenseRequestTool()
+route_license_request = RouteLicenseRequestTool()
 
 
 # ---------------------------------------------------------------------------

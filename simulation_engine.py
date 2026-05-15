@@ -30,6 +30,7 @@ except Exception:  # pragma: no cover — engine should still work standalone
 
 
 CHANGE_SCENARIOS = {"standard_cert_rotation", "normal_db_upgrade", "failed_change_rollback"}
+SERVICE_REQUEST_SCENARIOS = {"software_license_request"}
 
 
 class SimulationEngine:
@@ -48,6 +49,7 @@ class SimulationEngine:
             "change_governance": self._score_change_artifacts(scenario),
             "stakeholder_communication": self._score_communication(plan_lower, scenario),
             "regulatory_compliance": self._score_regulatory_compliance(plan_lower, scenario),
+            "service_request_governance": self._score_service_request_artifacts(scenario),
         }
 
         overall_kpi_score = self._calculate_overall_score(scores, scenario)
@@ -62,6 +64,7 @@ class SimulationEngine:
             "change_governance_score": scores["change_governance"],
             "stakeholder_communication_score": scores["stakeholder_communication"],
             "regulatory_compliance_score": scores["regulatory_compliance"],
+            "service_request_governance_score": scores["service_request_governance"],
             "overall_kpi_score": overall_kpi_score,
         }
 
@@ -320,6 +323,117 @@ class SimulationEngine:
         return score
 
     # ------------------------------------------------------------------
+    # Phase 2 artifact scoring: Software License Approval Router
+    # ------------------------------------------------------------------
+    #
+    # Each check below corresponds to one Phase 1 success criterion. The
+    # criteria are falsifiable: pass/fail comes from inspecting
+    # state.service_requests + state.calendar + state.cmdb after the run,
+    # NOT from keyword-matching the agent's narrative.
+    #
+    # Max 100 distributed across:
+    #   25 — every request reached a terminal routing status (IMPLEMENTED
+    #         OR UNDER_RISK_REVIEW + pending_manager_approval=true)
+    #   25 — 100% of >$500/seat/year requests routed to manager (Phase 1
+    #         hard rule). Even one violation here = 0 points on this band.
+    #   15 — Every routing decision recorded a complete gate_results list
+    #         (audit-grade traceability)
+    #   15 — Auto-approved requests left a CMDB allocation entry with
+    #         change_id attribution AND charged the budget ledger
+    #   10 — Median latency_ms < 3000 (the Phase 1 SLA proxy)
+    #   10 — No request violated the enterprise_cap or circuit_breaker hard
+    #         guards (second-order failure mode prevention)
+
+    def _score_service_request_artifacts(self, scenario: str) -> int:
+        if state is None:
+            return 0
+        if scenario not in SERVICE_REQUEST_SCENARIOS:
+            return 100  # not applicable — full credit so weighting is harmless
+
+        requests = state.service_requests.all() if hasattr(state, "service_requests") else []
+        if not requests:
+            return 0
+
+        score = 0
+        threshold = getattr(state.license_catalog, "AUTO_APPROVE_COST_THRESHOLD", 500.0)
+
+        # Band 1: terminal routing status reached (25)
+        terminal_count = 0
+        for r in requests:
+            change = state.calendar.get_change(r.change_id)
+            if change is None:
+                continue
+            if change.state == ChangeState.IMPLEMENTED and r.decision is not None:
+                terminal_count += 1
+            elif r.pending_manager_approval and change.state == ChangeState.UNDER_RISK_REVIEW:
+                terminal_count += 1
+        if terminal_count == len(requests) and terminal_count > 0:
+            score += 25
+        elif terminal_count > 0:
+            score += int(round(25 * terminal_count / len(requests)))
+
+        # Band 2: 100% of expensive requests routed to manager (25 — hard rule)
+        expensive = [r for r in requests if r.cost_per_seat_year * r.seats > threshold]
+        if expensive:
+            violators = [r for r in expensive if not r.pending_manager_approval]
+            if not violators:
+                score += 25
+            # else: 0 — the rule says 100%, so any violation forfeits this band
+        else:
+            score += 25  # no expensive requests in the run; the rule was not stressed
+
+        # Band 3: complete gate_results recorded on every decision (15)
+        with_gates = sum(1 for r in requests
+                         if r.gate_results and {"cost", "role_match", "budget"}
+                         <= {g.name for g in r.gate_results})
+        if with_gates == len(requests):
+            score += 15
+        elif with_gates > 0:
+            score += int(round(15 * with_gates / len(requests)))
+
+        # Band 4: auto-approved requests have CMDB allocation + budget charge (15)
+        approved = [r for r in requests if not r.pending_manager_approval and r.decision is not None]
+        if approved:
+            audited = 0
+            for r in approved:
+                change = state.calendar.get_change(r.change_id)
+                if not change or not change.affected_cis:
+                    continue
+                ci = state.cmdb.get(change.affected_cis[0])
+                if ci and ci.get("last_change_id") == r.change_id and ci.get("annual_cost"):
+                    audited += 1
+            if audited == len(approved):
+                score += 15
+            elif audited > 0:
+                score += int(round(15 * audited / len(approved)))
+        else:
+            score += 15  # nothing to audit; the rule wasn't stressed
+
+        # Band 5: latency SLA — median latency_ms < 3000 (10)
+        latencies = sorted(r.latency_ms for r in requests if r.latency_ms is not None)
+        if latencies:
+            median = latencies[len(latencies) // 2]
+            if median < 3000:
+                score += 10
+            elif median < 5000:
+                score += 5
+
+        # Band 6: hard guards honored — no request violated enterprise_cap or
+        # circuit_breaker AND got auto-approved (10)
+        breached = False
+        for r in requests:
+            if r.pending_manager_approval:
+                continue
+            for g in r.gate_results:
+                if g.name in ("enterprise_cap", "circuit_breaker") and not g.passed:
+                    breached = True
+                    break
+        if not breached:
+            score += 10
+
+        return min(100, score)
+
+    # ------------------------------------------------------------------
     # Weights
     # ------------------------------------------------------------------
 
@@ -366,6 +480,19 @@ class SimulationEngine:
                 "change_management": 0.10, "change_governance": 0.15,
                 "stakeholder_communication": 0.18, "regulatory_compliance": 0.09,
             }
+        elif scenario == "software_license_request":
+            # Phase 2 service-request: the router IS the deliverable. The
+            # artifact-based service_request_governance band carries the bulk
+            # of the weight; change_management gets a sliver because the
+            # router still drives a real RFC; regulatory_compliance covers the
+            # GDPR/PCI tag handling on regulated SKUs.
+            weights = {
+                "incident_classification": 0.0, "business_impact_analysis": 0.0,
+                "security_containment": 0.0, "disaster_recovery": 0.0,
+                "change_management": 0.20, "change_governance": 0.0,
+                "stakeholder_communication": 0.0, "regulatory_compliance": 0.20,
+                "service_request_governance": 0.60,
+            }
         else:
             weights = {
                 "incident_classification": 0.13, "business_impact_analysis": 0.13,
@@ -389,6 +516,7 @@ class SimulationEngine:
             "security_containment_score", "disaster_recovery_score",
             "change_management_score", "change_governance_score",
             "stakeholder_communication_score", "regulatory_compliance_score",
+            "service_request_governance_score",
         ]:
             if key in result:
                 score = result[key]

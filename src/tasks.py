@@ -345,6 +345,79 @@ task_change_pir = Task(
 )
 
 
+# ============================================================================
+# SERVICE-REQUEST TASKS (Phase 2 — Automated Software License Approval)
+# ============================================================================
+#
+# Two tasks, narrow on purpose. The agent under test is the License Approval
+# Router (agent[9]). The intake task simply lifts the request into state so
+# the router has something to decide about. The router task IS the Phase 1
+# decision moment — it stops at "Provisioning Triggered" or "Pending Manager
+# Approval", which are the IMPLEMENTED state and the UNDER_RISK_REVIEW +
+# pending_manager_approval=true state respectively.
+
+
+task_license_intake = Task(
+    description=(
+        "SOFTWARE LICENSE SERVICE-REQUEST INTAKE\n\n"
+        "Incoming service request: {event_description}\n\n"
+        "As the Service Owner, register the request so the License Approval Router can decide:\n"
+        "1. Parse the request and identify: requester email, requester_role (e.g., 'designer', "
+        "'developer', 'non-developer', 'analyst', 'sales'), department (engineering, design, "
+        "marketing, sales, operations, finance), license_sku (one of ADOBE-CC-FULL, "
+        "ADOBE-ACROBAT-STD, JETBRAINS-IDEA-ULT, SLACK-BUSINESS-PLUS, ZOOM-PRO, "
+        "SALESFORCE-CRM-ENT), and seats (default 1).\n"
+        "2. Call submit_license_request with those fields. Capture the returned request_id and "
+        "change_id — the router will reference them.\n\n"
+        "Deliverables: request_id, change_id, SKU, requester role and department, seat count, "
+        "and the applicable STD-LIC-* template the router would use on auto-approval."
+    ),
+    agent=agents[5],
+    expected_output=(
+        "Service-request intake record: request_id, change_id, license_sku, requester_role, "
+        "department, seats, annual_cost, applicable_template, and submitted_at timestamp."
+    ),
+)
+
+
+task_route_license_request = Task(
+    description=(
+        "LICENSE APPROVAL ROUTING — THE DECISION MOMENT\n\n"
+        "You are the Phase 1 agent. A single license service request has been registered "
+        "(see prior task output for request_id and license_sku). Decide: auto-approve and "
+        "provision, OR route to manager for manual review. You apply three deterministic gates "
+        "plus two hard guards.\n\n"
+        "Steps:\n"
+        "1. Call query_license_catalog with the license_sku to confirm cost_per_seat_year, "
+        "eligible_roles, enterprise_cap, and the matching STD-LIC-* template.\n"
+        "2. Call check_budget with the department to confirm headroom and circuit-breaker status.\n"
+        "3. Call route_license_request with the request_id. This applies the three gates "
+        "(cost <= $500/seat/year, role match, budget headroom) AND the hard guards "
+        "(enterprise_cap, circuit_breaker). The tool returns the LicenseRequestRecord with the "
+        "gate-by-gate results, the routing decision, the audit reasons, and the latency in ms.\n"
+        "4. STOP. Do not call any other tool. Your stopping point is one of:\n"
+        "   - state = IMPLEMENTED + decision=auto_approve  (Provisioning Triggered)\n"
+        "   - state = UNDER_RISK_REVIEW + pending_manager_approval=true  (Pending Manager)\n\n"
+        "Constraints you must honor:\n"
+        "- NEVER auto-approve if any gate fails — route to manager.\n"
+        "- NEVER auto-approve if enterprise_cap would be breached, even if cost is below the "
+        "threshold (this prevents vendor true-up audits).\n"
+        "- NEVER auto-approve if the department's circuit_breaker is active (this exists because "
+        "Finance previously froze ALL automated approvals after an overrun, and the circuit "
+        "breaker is how we avoid a repeat)."
+    ),
+    agent=agents[9],
+    expected_output=(
+        "License routing decision record: request_id, change_id, license_sku, decision "
+        "(auto_approve | route_to_manager), gate_results (cost, role_match, budget, "
+        "optionally enterprise_cap / circuit_breaker), decision_reasons (audit-grade strings), "
+        "final ChangeState (implemented or under_risk_review), pending_manager_approval flag, "
+        "latency_ms, and the CMDB allocation entry (if auto-approved)."
+    ),
+    context=[task_license_intake],
+)
+
+
 # Sequence helpers used by bcm_crew.py
 INCIDENT_TASKS = [
     task_classify,
@@ -378,6 +451,12 @@ STANDARD_CHANGE_TASKS = [
 # Failed-change scenario uses the same task graph as a normal change; the scenario
 # brief instructs the implementer to set force_backout=true.
 FAILED_CHANGE_TASKS = NORMAL_CHANGE_TASKS
+
+# Phase 2 service-request flow: narrow scope — intake + the one routing decision.
+SERVICE_REQUEST_TASKS = [
+    task_license_intake,
+    task_route_license_request,
+]
 
 
 # Backwards-compat exports — old call sites used task1..task6.
